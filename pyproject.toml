@@ -1,0 +1,26 @@
+[project]
+name = "ai-document-assistant"
+version = "0.1.0"
+description = ""
+authors = [{ name = "Nwoke" }]
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "nest-asyncio>=1.6.0,<2.0.0",
+  "python-dotenv>=1.1.1,<2.0.0",
+  "streamlit>=1.49.1,<2.0.0",
+  "llama-index>=0.14.2,<0.15.0",
+  "llama-index-embeddings-fastembed>=0.5.0,<0.6.0",
+  "llama-index-embeddings-huggingface>=0.6.1,<0.7.0",
+  "llama-index-llms-huggingface>=0.6.1,<0.7.0",
+  "llama-index-vector-stores-qdrant>=0.8.5; python_version < '3.14'",
+  "qdrant-client (>=1.15.1,<2.0.0)",
+  "fastembed (>=0.7.3,<0.8.0)"
+]
+
+[tool.poetry]
+packages = [{ include = "rag.py", from = "src" }]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
