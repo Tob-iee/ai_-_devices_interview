@@ -5,7 +5,6 @@ import torch
 import logging
 from typing import Optional
 
-import nest_asyncio
 import streamlit as st
 
 from health import run_health_checks
@@ -20,7 +19,6 @@ except Exception:
 def main():
 
     st.set_page_config(page_title="AI Document Assistant", page_icon=":books:", layout="wide")
-    nest_asyncio.apply()
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     logger = logging.getLogger("streamlit-app")
 
@@ -34,10 +32,10 @@ def main():
     ]
 
     EMBED_OPTIONS = [
-        "BAAI/bge-small-en-v1.5",
-        "BAAI/bge-base-en-v1.5",
         "sentence-transformers/all-MiniLM-L6-v2",
         "sentence-transformers/all-mpnet-base-v2",
+        "BAAI/bge-small-en-v1.5",
+        "BAAI/bge-base-en-v1.5",
     ]
 
 # result = run_health_checks(
