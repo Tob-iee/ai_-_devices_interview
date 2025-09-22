@@ -26,9 +26,13 @@ def main():
     st.caption("Upload PDF, select your models, and ask questions. Embeddings are built at runtime.")
 
     LLM_OPTIONS = [
+        "Qwen/Qwen1.5-1.8B-Chat",
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         "HuggingFaceH4/zephyr-7b-beta",
         "openai/gpt-oss-20b"
+        "meta-llama/Llama-2-7b-chat-hf",
+        "google/gemma-2b"
+        "microsoft/phi-2-2.7b",
     ]
 
     EMBED_OPTIONS = [
