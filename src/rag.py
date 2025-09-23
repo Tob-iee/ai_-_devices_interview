@@ -17,6 +17,10 @@ from llama_index.core import (
     DocumentSummaryIndex,
     SimpleDirectoryReader,
 )
+
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import MetadataMode
 from llama_index.core.tools import QueryEngineTool
@@ -26,11 +30,19 @@ from llama_index.core.query_engine.router_query_engine import RouterQueryEngine
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.node_parser import SentenceSplitter, SemanticSplitterNodeParser
 
+from llama_index.core.retrievers import RouterRetriever
+from llama_index.core.selectors import PydanticSingleSelector
+from llama_index.core.tools import RetrieverTool
+
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.embeddings.fastembed import FastEmbedEmbedding
 
 from llama_parse import LlamaParse
+
+from llama_index.core import PromptTemplate
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.chat_engine import CondenseQuestionChatEngine, ContextChatEngine
 
 from qdrant_client import QdrantClient
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -42,6 +54,8 @@ from core.utils import _choose_device, _choose_dtype, format_response_payload
 dotenv.load_dotenv()
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger("rag-core")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 SYSTEM_PROMPT = (
     "You are a document Q&A assistant. Answer ONLY from the provided context. "
@@ -81,6 +95,34 @@ TEACH_SYSTEM = PromptTemplate(
     "Given this information, answer the question. Focus on what's most important to answer the user's request. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers:\n"
     "{query_str}\n"
 )
+
+CUSTOM_SUMMARIZE_PROMPT = PromptTemplate(
+    """\
+Given a conversation (between Human and Assistant) and a follow up message from Human, \
+rewrite the message to be a standalone question that captures all relevant context \
+from the conversation. \
+You are a document Q&A assistant. Answer ONLY from the provided context. \
+If the answer is not in the context, say: \"I don't know based on the provided documents.\" \
+Be concise and do not repeat instructions.
+
+<Chat History>
+{chat_history}
+
+<Follow Up Message>
+{question}
+
+<Standalone question>
+"""
+)
+
+# list of `ChatMessage` objects
+CUSTOM_SUMMARIZE_CHAT_HISTORY = [
+    ChatMessage(
+        role=MessageRole.USER,
+        content="Hello assistant, Summarize the key points from the context which is the documents I uploaded. Avoid quoting large passages; use your own words.",
+    ),
+    ChatMessage(role=MessageRole.ASSISTANT, content="Given this information, answer the question. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers"),
+]
 
 
 @lru_cache(maxsize=3)
@@ -253,8 +295,6 @@ def build_sum_index_from_uploads(
     """
     Build a SummaryIndex for a single uploaded PDF.
     """
-    embed = build_hf_embeddings(embed_model)
-    Settings.embed_model = embed
     Settings.chunk_size = chunk_size
     Settings.chunk_overlap = chunk_overlap
 
@@ -269,21 +309,21 @@ def build_sum_index_from_uploads(
     file_name = os.path.basename(file_path)
 
     # Check if file has already been indexed by searching for its metadata
-    try:
-        # Query Qdrant for points with metadata 'file_name'
-        results = summary_store._client.scroll(
-            collection_name=collection_name,
-            filter={"must": [{"key": "file_name", "match": {"value": file_name}}]},
-            limit=1,
-        )
-        already_indexed = len(results[1]) > 0
-    except Exception:
-        already_indexed = False
+    # try:
+    #     # Query Qdrant for points with metadata 'file_name'
+    #     results = summary_store._client.scroll(
+    #         collection_name=collection_name,
+    #         filter={"must": [{"key": "file_name", "match": {"value": file_name}}]},
+    #         limit=1,
+    #     )
+    #     already_indexed = len(results[1]) > 0
+    # except Exception:
+    #     already_indexed = False
 
-    if already_indexed:
-        logger.info(f"File '{file_name}' already indexed. Loading existing index.")
-        index = SummaryIndex.from_vector_store(summary_store)
-        return index
+    # if already_indexed:
+    #     logger.info(f"File '{file_name}' already indexed. Loading existing index.")
+    #     index = SummaryIndex.from_vector_store(summary_store)
+    #     return index
 
     # Parse and index the document if not already indexed
     try:
@@ -387,7 +427,197 @@ def build_sum_index_from_uploads(
 #     response = chat_engine.chat(question)
 #     return response
 
-def build_single_chat_engine(
+# def build_single_chat_engine(
+#     *,
+#     mode: str,
+#     vec_index: Union[VectorStoreIndex, None],
+#     sum_index: Union[SummaryIndex, None],
+#     llm_model: str,
+#     top_k: int = 3,
+# ):
+#     """
+#     Build exactly ONE chat engine for the selected mode.
+#     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
+#     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
+#     """
+#     llm = build_llm(llm_model)
+#     Settings.llm = llm
+
+#     # Settings.tokenizer = tokenizer = AutoTokenizer.from_pretrained(llm_model)
+#     # max_length = tokenizer.model_max_length
+
+#     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
+
+#     if mode == "summarize":
+#         if sum_index is None:
+#             raise ValueError("SummaryIndex not provided for summarize mode.")
+
+#         summary_query_engine = sum_index.as_chat_engine(
+#             chat_mode="context",
+#             # memory=memory,
+#             verbose=True,
+#             # response_mode="tree_summarize",
+#             # use_async=True,
+#             # text_qa_template=SUMMARIZE_SYSTEM,
+#             # similarity_top_k=top_k,
+#         )
+#         # return engine
+#         summary_tool = QueryEngineTool.from_defaults(
+#             query_engine=summary_query_engine,
+#             description=(
+#                 "Useful for summarizing of the lora paper."
+#             )
+#         )
+#         return summary_tool
+
+#     # explain / teach => vector index
+#     elif mode == "explain":
+#         if vec_index is None:
+#             raise ValueError("VectorStoreIndex not provided for explain mode.")
+
+#         vector_query_engine = vec_index.as_chat_engine(
+#             chat_mode="condense_plus_context",
+#             memory=memory,
+#             verbose=True,
+#         )
+#         # return engine
+
+#         vector_tool = QueryEngineTool.from_defaults(
+#             query_engine=vector_query_engine,
+#             description=(
+#                 "Useful for retrieving specific context related to the document."
+#             )
+#         )
+#         return vector_tool
+    
+#     elif mode == "teach":
+#         if vec_index is None:
+#             raise ValueError("VectorStoreIndex not provided for teach mode.")
+
+#         teach_query_engine = vec_index.as_chat_engine(
+#             chat_mode="react",
+#             memory=memory,
+#             verbose=True,
+#         )
+#         # return engine
+#         teach_tool = QueryEngineTool.from_defaults(
+#             query_engine=teach_query_engine,
+#             description=(
+#                 "Useful for teaching concepts related to the document."
+#             )
+#         )
+#         return teach_tool
+
+#         # chat_engine = RouterQueryEngine(
+#         #     selector=LLMSingleSelector.from_defaults(),
+#         #     query_engine_tools=[summary_tool, vector_tool, teach_tool],
+#         #     verbose=True,
+#         # )
+#         # return chat_engine
+
+# def build_chat_engine(
+#     *,
+#     mode: str,
+#     vec_index: Union[VectorStoreIndex, None],
+#     sum_index: Union[SummaryIndex, None],
+#     llm_model: str,
+#     top_k: int = 3,
+# ):
+#     """
+#     Build exactly ONE chat engine for the selected mode.
+#     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
+#     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
+#     """
+#     # llm = build_llm(llm_model)
+#     # Settings.llm = llm
+
+#     Settings.llm = OpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
+#     # Settings.embed_model = OpenAIEmbedding(model="text-embedding-ada-002")
+
+#     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
+
+#     if mode == "summarize":
+#         if sum_index is None:
+#             raise ValueError("SummaryIndex not provided for summarize mode.")
+
+#         summary_query_engine = sum_index.as_query_engine(
+#             response_mode="tree_summarize",
+#             use_async=True
+#         )
+#         summary_chat_engine = CondenseQuestionChatEngine.from_defaults(
+#             query_engine=summary_query_engine,
+#             condense_question_prompt=CUSTOM_SUMMARIZE_PROMPT,
+#             chat_history=CUSTOM_SUMMARIZE_CHAT_HISTORY,
+#             verbose=True,
+#         )
+
+#         # return summary_chat_engine
+#             # chat_mode="context",
+#             # memory=memory,
+#             # verbose=True,
+#             # response_mode="tree_summarize",
+#             # use_async=True,
+#             # text_qa_template=SUMMARIZE_SYSTEM,
+#             # similarity_top_k=top_k,
+
+#         summary_tool = QueryEngineTool.from_defaults(
+#             query_engine=summary_chat_engine,
+#             description=(
+#                 "Useful for summarizing of documents."
+#             )
+#         )
+#         # return summary_tool
+
+#     # explain / teach => vector index
+#     # elif mode == "explain":
+#     #     if vec_index is None:
+#     #         raise ValueError("VectorStoreIndex not provided for explain mode.")
+
+#     #     vector_query_engine = vec_index.as_chat_engine(
+#     #         chat_mode="condense_plus_context",
+#     #         memory=memory,
+#     #         verbose=True,
+#     #     )
+#         # return engine
+
+#     #     vector_tool = QueryEngineTool.from_defaults(
+#     #         query_engine=vector_query_engine,
+#     #         description=(
+#     #             "Useful for retrieving specific context related to the document."
+#     #         )
+#     #     )
+#     #     return vector_tool
+    
+#     # elif mode == "teach":
+#     #     if vec_index is None:
+#     #         raise ValueError("VectorStoreIndex not provided for teach mode.")
+
+#     #     teach_query_engine = vec_index.as_chat_engine(
+#     #         chat_mode="react",
+#     #         memory=memory,
+#     #         verbose=True,
+#     #     )
+#     #     # return engine
+#     #     teach_tool = QueryEngineTool.from_defaults(
+#     #         query_engine=teach_query_engine,
+#     #         description=(
+#     #             "Useful for teaching concepts related to the document."
+#     #         )
+#     #     )
+#     #     return teach_tool
+
+#     chat_engine = RouterQueryEngine(
+#         selector=LLMSingleSelector.from_defaults(),
+#         query_engine_tools=[summary_tool, 
+#                             # vector_tool, 
+#                             # teach_tool
+#                             ],
+#         verbose=True,
+#     )
+#     return chat_engine
+
+
+def build_chat_engine(
     *,
     mode: str,
     vec_index: Union[VectorStoreIndex, None],
@@ -400,51 +630,79 @@ def build_single_chat_engine(
     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
     """
-    llm = build_llm(llm_model)
-    Settings.llm = llm
+    # llm = build_llm(llm_model)
+    # Settings.llm = llm
 
-    # Settings.tokenizer = tokenizer = AutoTokenizer.from_pretrained(llm_model)
-    # max_length = tokenizer.model_max_length
+    Settings.llm = OpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
+    # Settings.embed_model = OpenAIEmbedding(model="text-embedding-ada-002")
 
-    # memory = ChatMemoryBuffer.from_defaults(token_limit=500)
+    memory = ChatMemoryBuffer.from_defaults(token_limit=500)
 
     if mode == "summarize":
         if sum_index is None:
             raise ValueError("SummaryIndex not provided for summarize mode.")
 
-        engine = sum_index.as_chat_engine(
-            chat_mode="context",
-            # memory=memory,
-            verbose=True,
-            # response_mode="tree_summarize",
-            # use_async=True,
-            # text_qa_template=SUMMARIZE_SYSTEM,
-            # similarity_top_k=top_k,
+        summary_retriever = sum_index.as_retriever()
+
+        summary_tool = RetrieverTool.from_defaults(
+            retriever=summary_retriever,
+            description=(
+                "Useful for retrieving context for summarizing of documents."
+            )
         )
-        return engine
+        # return summary_tool
 
     # explain / teach => vector index
-    elif mode == "explain":
-        if vec_index is None:
-            raise ValueError("VectorStoreIndex not provided for explain mode.")
+    # elif mode == "explain":
+    #     if vec_index is None:
+    #         raise ValueError("VectorStoreIndex not provided for explain mode.")
 
-        engine = vec_index.as_chat_engine(
-            chat_mode="condense_plus_context",
-            memory=memory,
-            verbose=True,
-        )
-        return engine
+    #     vector_query_engine = vec_index.as_chat_engine(
+    #         chat_mode="condense_plus_context",
+    #         memory=memory,
+    #         verbose=True,
+    #     )
+        # return engine
+
+    #     vector_tool = QueryEngineTool.from_defaults(
+    #         query_engine=vector_query_engine,
+    #         description=(
+    #             "Useful for retrieving specific context related to the document."
+    #         )
+    #     )
+    #     return vector_tool
     
-    elif mode == "teach":
-        if vec_index is None:
-            raise ValueError("VectorStoreIndex not provided for teach mode.")
+    # elif mode == "teach":
+    #     if vec_index is None:
+    #         raise ValueError("VectorStoreIndex not provided for teach mode.")
 
-        engine = vec_index.as_chat_engine(
-            chat_mode="react",
-            memory=memory,
-            verbose=True,
-        )
-        return engine
+    #     teach_query_engine = vec_index.as_chat_engine(
+    #         chat_mode="react",
+    #         memory=memory,
+    #         verbose=True,
+    #     )
+    #     # return engine
+    #     teach_tool = QueryEngineTool.from_defaults(
+    #         query_engine=teach_query_engine,
+    #         description=(
+    #             "Useful for teaching concepts related to the document."
+    #         )
+    #     )
+    #     return teach_tool
+
+
+    retriever = RouterRetriever(
+        selector=PydanticSingleSelector.from_defaults(), #LLMSingleSelector
+        retriever_tools=[ summary_tool],
+    )
+
+    context_chat_engine = ContextChatEngine.from_defaults(
+    retriever=retriever
+    )
+
+
+    return context_chat_engine
+
 
 def main():
     parser = argparse.ArgumentParser(description="RAG over a single PDF using LlamaIndex + Qdrant")
@@ -494,7 +752,14 @@ def main():
             )
 
         # Build exactly one chat engine for the chosen mode
-        chat_engine = build_single_chat_engine(
+        # chat_engine = build_single_chat_engine(
+        #     mode=mode,
+        #     vec_index=vec_index,
+        #     sum_index=sum_index,
+        #     llm_model=args.llm_model,
+        #     top_k=args.top_k,
+        # )
+        chat_engine= build_chat_engine(
             mode=mode,
             vec_index=vec_index,
             sum_index=sum_index,
@@ -502,6 +767,8 @@ def main():
             top_k=args.top_k,
         )
 
+
+        
         print(f"Interactive chat started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
         while True:
             question = input("\nUser: ").strip()
