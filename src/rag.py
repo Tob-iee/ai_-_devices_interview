@@ -43,7 +43,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_parse import LlamaParse
 
 from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.core.chat_engine import CondenseQuestionChatEngine, ContextChatEngine
+from llama_index.core.chat_engine import ContextChatEngine, CondensePlusContextChatEngine, CondenseQuestionChatEngine
 
 from qdrant_client import QdrantClient
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -317,10 +317,9 @@ def build_chat_engine(
     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
     """
-    llm = build_llm(llm_model)
-    Settings.llm = llm
+    hf_os_llm = build_llm(llm_model)
+    llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
 
-    # llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
     # Settings.llm = llm
     
     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
@@ -341,16 +340,16 @@ def build_chat_engine(
         retriever = summary_tool.retriever
         summary_context_chat_engine = ContextChatEngine.from_defaults(
         retriever=retriever,
-        # memory=memory,
         chat_history= CUSTOM_SUMMARIZE_CHAT_HISTORY,
         system_prompt= SYSTEM_PROMPT,
+        memory=memory,
         # prefix_messages=prefix_messages,
         # node_postprocessors=node_postprocessors,
         # context_template=CUSTOM_SUMMARIZE_PROMPT,
         # context_refine_template=context_refine_template,
-        # llm
-        ) 
-    
+        llm=hf_os_llm
+        )
+
         return summary_context_chat_engine
 
     # explain / teach => vector index
@@ -358,32 +357,34 @@ def build_chat_engine(
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for explain mode.")
 
-        explain_query_engine = vec_index.as_query_engine()
+        explain_retriever = vec_index.as_retriever() or VectorIndexAutoRetriever(vec_index)
 
-        explain_query_engine_tool = QueryEngineTool.from_defaults(
-            query_engine=explain_query_engine,
-            name="explain_query_engine",
+        explain_tool = RetrieverTool.from_defaults(
+            retriever=explain_retriever,
             description=(
-                "Useful for retrieving contents from the documents for explaining purposes based on the user's query."
+                "Useful for retrieving context for explaining of documents."
             )
         )
-
-        explain_context_chat_engine = CondenseQuestionChatEngine.from_defaults(
-            query_engine=explain_query_engine_tool.query_engine,
-            # condense_question_prompt=condense_question_prompt,
-            # chat_history=CUSTOM_EXPLAIN_CHAT_HISTORY,
-            # system_prompt=SYSTEM_PROMPT,
-            # memory=memory,
-            # memory_cls= memory_cls,
-            # prefix_messages=prefix_messages,
-            verbose=True,
-            # llm
+        retriever = explain_tool.retriever
+        explain_context_chat_engine = CondensePlusContextChatEngine.from_defaults(
+        retriever=retriever,
+        # chat_history= CUSTOM_EXPLAIN_CHAT_HISTORY,
+        system_prompt= SYSTEM_PROMPT,
+        memory=memory,
+        # prefix_messages=prefix_messages,
+        # node_postprocessors=node_postprocessors,
+        # context_template=CUSTOM_SUMMARIZE_PROMPT,
+        # context_refine_template=context_refine_template,
+        llm=hf_os_llm
         )
+
         return explain_context_chat_engine
 
     elif mode == "teach":
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for teach mode.")
+        llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
+        Settings.llm = llm
 
         teach_engine = vec_index.as_query_engine() 
         teach_engine_tool = QueryEngineTool.from_defaults(
@@ -405,7 +406,7 @@ def build_chat_engine(
             agents=[retriever_agent],
             root_agent="retriever",
         )
-        return agent_workflow
+    return agent_workflow
 
 
 async def main():
@@ -454,6 +455,17 @@ async def main():
                 port=args.qdrant_port,
                 collection_name=args.vec_collection,
             )
+
+        chat_engine_tool = build_chat_engine(
+            mode=mode,
+            vec_index=vec_index,
+            sum_index=sum_index,
+            llm_model=args.llm_model,
+            top_k=args.top_k,
+        )
+
+        print(chat_engine_tool)
+
 
         if mode == "summarize" or mode == "explain":
 
@@ -505,8 +517,6 @@ async def main():
                 agent_resp = await agent.run(question, ctx=ctx, stream=True)
 
                 print(agent_resp)
-
-
 
     except Exception as e:
         logger.error(f"Error running RAG: {e}")
