@@ -20,8 +20,6 @@ from llama_index.core import (
     SimpleDirectoryReader,
 )
 
-from llama_index.llms.openai import OpenAI
-from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.retrievers import VectorIndexAutoRetriever
 
 
@@ -52,7 +50,7 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.storage.storage_context import StorageContext
 
 from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
-from llama_index.core.agent.workflow import ReActAgent, FunctionAgent, AgentStream, ToolCallResult, AgentWorkflow
+from llama_index.core.agent.workflow import FunctionAgent, AgentWorkflow, ReActAgent, AgentStream, ToolCallResult
 
 from llama_index.core.workflow import Context
 
@@ -74,7 +72,6 @@ logger = logging.getLogger("rag-core")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 
 @lru_cache(maxsize=3)
 def build_llm(model_name: str) -> HuggingFaceLLM:
@@ -102,18 +99,12 @@ def build_llm(model_name: str) -> HuggingFaceLLM:
         generate_kwargs={"do_sample": False, "repetition_penalty": 1.05},
     )
 
-# def call_openai_llm(model_name: str, api_key: str) -> OpenAI:
-#     return OpenAI(model=model_name, api_key=api_key)
-
 def call_groq_llm(model_name: str, api_key: str) -> Groq:
     return Groq(model=model_name, api_key=api_key)
 
 def build_hf_embeddings(embed_model: str) -> None:
     """Build Huggingface embeddings."""
     return HuggingFaceEmbedding(model_name=embed_model)
-
-# def call_openai_embeddings(embed_model: str, api_key: str) -> OpenAI:
-#     return OpenAIEmbedding(model=embed_model, api_key=api_key)
 
 def connect_qdrant(
     host: str = "localhost",
@@ -176,9 +167,6 @@ def build_vec_index_from_uploads(
     embed = build_hf_embeddings(embed_model)
     Settings.embed_model = embed
 
-
-    # embed = call_openai_embeddings(model="text-embedding-ada-002", api_key=OPENAI_API_KEY)
-    # Settings.embed_model = embed
 
     Settings.chunk_size = chunk_size
     Settings.chunk_overlap = chunk_overlap
@@ -252,20 +240,13 @@ def build_sum_index_from_uploads(
     collection_name: str = "ai-document-assistant-summary",
     chunk_size: int = 100,
     chunk_overlap: int = 20,
-) -> VectorStoreIndex: #SummaryIndex:
+) -> VectorStoreIndex:
     """
     Build a SummaryIndex for a single uploaded PDF.
     """
-    # llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
-    # Settings.llm = llm
-
-    # llm = build_llm(llm_model)
-    # Settings.llm = llm
 
     embed = build_hf_embeddings(embed_model)
     Settings.embed_model = embed
-
-    
 
     Settings.chunk_size = chunk_size
     Settings.chunk_overlap = chunk_overlap
@@ -319,18 +300,7 @@ def build_sum_index_from_uploads(
     logger.info(f"Loaded and split {len(docs)} document(s) into {len(nodes)} nodes from: {file_name}")
 
     # SummaryIndex builds its own tree over the docs
-    index = VectorStoreIndex.from_documents(nodes,storage_context=storage_context)
-    # index = SummaryIndex.from_documents(nodes, 
-    #                                     show_progress=True,
-    #                                     storage_context=storage_context
-    #                                     )
-    
-    # index = DocumentSummaryIndex.from_documents(nodes,
-    #                                             embed_model=embed_model,
-    #                                             show_progress=True,
-    #                                             llm=llm,
-    #                                             storage_context=storage_context
-    # )
+    index = VectorStoreIndex.from_documents(nodes, storage_context=storage_context)
     logger.info(f"SummaryIndexed {len(nodes)} nodes into collection '{collection_name}'")
     return index
 
@@ -353,16 +323,13 @@ def build_chat_engine(
     # llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
     # Settings.llm = llm
     
-    # embed = call_openai_embeddings(model="text-embedding-ada-002", api_key=OPENAI_API_KEY)
-    # Settings.embed_model = embed
-
     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
 
     if mode == "summarize":
         if sum_index is None:
             raise ValueError("SummaryIndex not provided for summarize mode.")
 
-        summary_retriever = sum_index.as_retriever()
+        summary_retriever = sum_index.as_retriever() or VectorIndexAutoRetriever(sum_index)
 
         summary_tool = RetrieverTool.from_defaults(
             retriever=summary_retriever,
@@ -391,16 +358,6 @@ def build_chat_engine(
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for explain mode.")
 
-        # vector_retriever = vec_index.as_retriever() or VectorIndexAutoRetriever(vec_index)
-
-        # vector_tool = RetrieverTool.from_defaults(
-        #     retriever=vector_retriever,
-        #     description=(
-        #         "Useful for retrieving context for explaining of documents."
-        #     )
-        # )
-        # retriever = vector_tool.retriever
-
         explain_query_engine = vec_index.as_query_engine()
 
         explain_query_engine_tool = QueryEngineTool.from_defaults(
@@ -428,8 +385,7 @@ def build_chat_engine(
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for teach mode.")
 
-        teach_engine = vec_index.as_query_engine() #or VectorIndexAutoRetriever(vec_index)
-
+        teach_engine = vec_index.as_query_engine() 
         teach_engine_tool = QueryEngineTool.from_defaults(
             query_engine=teach_engine,
             description=(
@@ -450,52 +406,6 @@ def build_chat_engine(
             root_agent="retriever",
         )
         return agent_workflow
-    
-
-        # agent = ReActAgent(
-        #     tools=[teach_engine_tool],
-        #     llm=llm,
-        #     # system_prompt=SYSTEM_PROMPT
-        # )      
-        # 
-        # return agent
-
-
-        # teach_retriever = vec_index.as_retriever() #or VectorIndexAutoRetriever(vec_index)
-        # teach_tool = RetrieverTool.from_defaults(
-        #     retriever=teach_retriever,
-        #     description=(
-        #         "Useful for retrieving contents from the documents for teaching purposes based on the user's query."
-        #     )
-        # )
-
-        # teaching_context_chat_engine = CondenseQuestionChatEngine.from_defaults( #ReActAgent or FunctionAgent classes from llama_index.core.agent.workflow
-        # retriever=teach_retriever_tool,
-        # memory=memory,
-        # chat_history=chat_history,
-        # system_prompt= system ,
-        # prefix_messages=prefix_messages,
-        # node_postprocessors=node_postprocessors,
-        # context_template=context_template,
-        # context_refine_template=context_refine_template,
-        # llm
-        # )
-
-
-        # teach_retriever_tool = teach_tool
-        # web_tools = DuckDuckGoSearchToolSpec().to_tool_list()
-
-        # teaching_agent = ReActAgent(tools=[teach_retriever_tool, *web_tools], llm=llm)
-        # return teaching_agent
-    
-    # retriever = RouterRetriever(
-    #     selector=LLMSingleSelector.from_defaults(), #LLMSingleSelector PydanticSingleSelector
-    #     retriever_tools=[summary_context_chat_engine, 
-    #                      explain_context_chat_engine, 
-    #                      teach_tool
-    #                     ],
-    # )
-
 
 
 async def main():
@@ -581,14 +491,7 @@ async def main():
                 llm_model=args.llm_model,
                 top_k=args.top_k,
             )
-            # question = "based on these new tax laws, give me a strategy on how an employee who earns 800,000 NGN monthly can adjust their financial planning and make the most of their income while complying with the new regulations"
-            # ctx = Context(agent)
-            # print(await agent.run(question, ctx=ctx, stream=True))
 
-            # agent_handler = await agent.run(question, ctx=ctx, stream=True)
-            # print(agent_handler)
-
-            # print(f"Interactive teaching agent started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
             while True:
                 # avoid blocking the event loop with input()
                 question = input("\nUser: ")
@@ -603,44 +506,6 @@ async def main():
 
                 print(agent_resp)
 
-            # handler = agent.chat(user_msg=question)  #Optional[Union[str, ChatMessage]] = None,
-                                    #   chat_history=chat_history,  #Optional[List[ChatMessage]] = None,
-                                    #   memory=memory,  #Optional[BaseMemory] = None,
-                                    #   ctx=ctx,  #Optional[Context] = None,
-                                    #   max_iterations=max_iterations,  #Optional[int] = None,
-                                    #   start_event=start_event  #Optional[Event] = None
-                                    # )
-            # print(handler.stream_events())
-
-
-            # prompt_dict = handler.get_prompts()
-            # for k, v in prompt_dict.items():
-            #     print(f"Prompt: {k}\n\nValue: {v.template}")
-
-            # async for ev in handler.stream_events():
-            #     if isinstance(ev, ToolCallResult):
-            #         print(f"\nCall {ev.tool_name} with {ev.tool_kwargs}\nReturned: {ev.tool_output}")
-            #     if isinstance(ev, AgentStream):
-            #         print(f"{ev.delta}", end="", flush=True)
-
-            # response = await handler
-
-
-
-            # print(f"Interactive teaching agent started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
-            # while True:
-            #     # avoid blocking the event loop with input()
-            #     question = await asyncio.to_thread(input, "\nUser: ")
-            #     question = question
-            #     if question.lower() in {"exit", "quit"}:
-            #         print("Exiting teaching agent.")
-            #         break
-
-            #     # >>> use the async API
-            #     ctx = Context(agent)
-            #     agent_resp = await agent.run(question, ctx=ctx, stream=True)
-
-                # print(f"Assistant: {agent_resp}")
 
 
     except Exception as e:
