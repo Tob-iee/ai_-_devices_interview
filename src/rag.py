@@ -5,9 +5,11 @@ import tempfile
 import logging
 import argparse
 from functools import lru_cache
+import traceback
 from typing import Union
 
 import dotenv
+import asyncio
 from transformers import AutoTokenizer
 
 from llama_index.core import (
@@ -20,10 +22,12 @@ from llama_index.core import (
 
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.retrievers import VectorIndexAutoRetriever
+
 
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import MetadataMode
-from llama_index.core.tools import QueryEngineTool
+from llama_index.core.tools import QueryEngineTool #RetrieverQueryEngine
 from llama_index.core.selectors import LLMSingleSelector
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.query_engine.router_query_engine import RouterQueryEngine
@@ -34,13 +38,12 @@ from llama_index.core.retrievers import RouterRetriever
 from llama_index.core.selectors import PydanticSingleSelector
 from llama_index.core.tools import RetrieverTool
 
+from llama_index.llms.groq import Groq
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
 
 from llama_parse import LlamaParse
 
-from llama_index.core import PromptTemplate
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.chat_engine import CondenseQuestionChatEngine, ContextChatEngine
 
@@ -48,81 +51,29 @@ from qdrant_client import QdrantClient
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.storage.storage_context import StorageContext
 
-from core.utils import _choose_device, _choose_dtype, format_response_payload
+from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
+from llama_index.core.agent.workflow import ReActAgent, FunctionAgent, AgentStream, ToolCallResult, AgentWorkflow
 
+from llama_index.core.workflow import Context
+
+from core.prompts import (
+    SYSTEM_PROMPT,
+    TEXT_QA_TEMPLATE,
+    SUMMARIZE_SYSTEM,
+    EXPLAIN_SYSTEM,
+    TEACH_SYSTEM,
+    CUSTOM_SUMMARIZE_PROMPT,
+    CUSTOM_SUMMARIZE_CHAT_HISTORY,
+)
+
+from core.utils import _choose_device, _choose_dtype, format_response_payload
 
 dotenv.load_dotenv()
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger("rag-core")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-SYSTEM_PROMPT = (
-    "You are a document Q&A assistant. Answer ONLY from the provided context. "
-    "If the answer is not in the context, say: \"I don't know based on the provided documents.\" "
-    "Be concise and do not repeat instructions."
-).strip()
-
-TEXT_QA_TEMPLATE = PromptTemplate(
-    "We have provided context information below.\n"
-    "---------------------\n"
-    "{context_str}\n"
-    "---------------------\n"
-    "Given this information, answer the question. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers:\n"
-    "{query_str}\n"
-)
-
-SUMMARIZE_SYSTEM = PromptTemplate(
-    "Summarize the key points from the context below in 5-8 bullet points.\n"
-    "Avoid quoting large passages; use your own words.\n"
-    "---------------------\n{context_str}\n---------------------\n"
-    "Given this information, answer the question. Focus on what's most important to answer the user's request. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers:\n"
-    "{query_str}\n"
-)
-
-EXPLAIN_SYSTEM = PromptTemplate(
-    "You explain concepts clearly and precisely using only the provided context. "
-    "Prefer short paragraphs and definitions sourced from the text."
-    "---------------------\n{context_str}\n---------------------\n"
-    "Given this information, answer the question. Focus on what's most important to answer the user's request. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers:\n"
-    "{query_str}\n"
-)
-
-TEACH_SYSTEM = PromptTemplate(
-    "You are a helpful tutor. Use ONLY the provided context. "
-    "Teach progressively, and if the user’s question is ambiguous, ask a brief clarifying question."
-    "---------------------\n{context_str}\n---------------------\n"
-    "Given this information, answer the question. Focus on what's most important to answer the user's request. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers:\n"
-    "{query_str}\n"
-)
-
-CUSTOM_SUMMARIZE_PROMPT = PromptTemplate(
-    """\
-Given a conversation (between Human and Assistant) and a follow up message from Human, \
-rewrite the message to be a standalone question that captures all relevant context \
-from the conversation. \
-You are a document Q&A assistant. Answer ONLY from the provided context. \
-If the answer is not in the context, say: \"I don't know based on the provided documents.\" \
-Be concise and do not repeat instructions.
-
-<Chat History>
-{chat_history}
-
-<Follow Up Message>
-{question}
-
-<Standalone question>
-"""
-)
-
-# list of `ChatMessage` objects
-CUSTOM_SUMMARIZE_CHAT_HISTORY = [
-    ChatMessage(
-        role=MessageRole.USER,
-        content="Hello assistant, Summarize the key points from the context which is the documents I uploaded. Avoid quoting large passages; use your own words.",
-    ),
-    ChatMessage(role=MessageRole.ASSISTANT, content="Given this information, answer the question. Do not reference the context or sources/page numbers in your answer, cite exact phrases from the context, or make up answers"),
-]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
 @lru_cache(maxsize=3)
@@ -151,13 +102,18 @@ def build_llm(model_name: str) -> HuggingFaceLLM:
         generate_kwargs={"do_sample": False, "repetition_penalty": 1.05},
     )
 
-def build_fast_embeddings(embed_model: str) -> None:
-    """Build FastEmbed embeddings."""
-    return FastEmbedEmbedding(model_name=embed_model)
+# def call_openai_llm(model_name: str, api_key: str) -> OpenAI:
+#     return OpenAI(model=model_name, api_key=api_key)
+
+def call_groq_llm(model_name: str, api_key: str) -> Groq:
+    return Groq(model=model_name, api_key=api_key)
 
 def build_hf_embeddings(embed_model: str) -> None:
     """Build Huggingface embeddings."""
     return HuggingFaceEmbedding(model_name=embed_model)
+
+# def call_openai_embeddings(embed_model: str, api_key: str) -> OpenAI:
+#     return OpenAIEmbedding(model=embed_model, api_key=api_key)
 
 def connect_qdrant(
     host: str = "localhost",
@@ -219,6 +175,11 @@ def build_vec_index_from_uploads(
     """
     embed = build_hf_embeddings(embed_model)
     Settings.embed_model = embed
+
+
+    # embed = call_openai_embeddings(model="text-embedding-ada-002", api_key=OPENAI_API_KEY)
+    # Settings.embed_model = embed
+
     Settings.chunk_size = chunk_size
     Settings.chunk_overlap = chunk_overlap
 
@@ -289,12 +250,23 @@ def build_sum_index_from_uploads(
     host: str = "localhost",
     port: int = 6333,
     collection_name: str = "ai-document-assistant-summary",
-    chunk_size: int = 350,
-    chunk_overlap: int = 60,
-) -> SummaryIndex:
+    chunk_size: int = 100,
+    chunk_overlap: int = 20,
+) -> VectorStoreIndex: #SummaryIndex:
     """
     Build a SummaryIndex for a single uploaded PDF.
     """
+    # llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
+    # Settings.llm = llm
+
+    # llm = build_llm(llm_model)
+    # Settings.llm = llm
+
+    embed = build_hf_embeddings(embed_model)
+    Settings.embed_model = embed
+
+    
+
     Settings.chunk_size = chunk_size
     Settings.chunk_overlap = chunk_overlap
 
@@ -309,21 +281,22 @@ def build_sum_index_from_uploads(
     file_name = os.path.basename(file_path)
 
     # Check if file has already been indexed by searching for its metadata
-    # try:
-    #     # Query Qdrant for points with metadata 'file_name'
-    #     results = summary_store._client.scroll(
-    #         collection_name=collection_name,
-    #         filter={"must": [{"key": "file_name", "match": {"value": file_name}}]},
-    #         limit=1,
-    #     )
-    #     already_indexed = len(results[1]) > 0
-    # except Exception:
-    #     already_indexed = False
+    try:
+        # Query Qdrant for points with metadata 'file_name'
+        results = summary_store._client.scroll(
+            collection_name=collection_name,
+            filter={"must": [{"key": "file_name", "match": {"value": file_name}}]},
+            limit=1,
+        )
+        already_indexed = len(results[1]) > 0
+    except Exception:
+        already_indexed = False
 
-    # if already_indexed:
-    #     logger.info(f"File '{file_name}' already indexed. Loading existing index.")
-    #     index = SummaryIndex.from_vector_store(summary_store)
-    #     return index
+    if already_indexed:
+        logger.info(f"File '{file_name}' already indexed. Loading existing index.")
+        # index = SummaryIndex(summary_store, show_progress=True, storage_context=storage_context)
+        index = VectorStoreIndex.from_vector_store(summary_store)
+        return index
 
     # Parse and index the document if not already indexed
     try:
@@ -346,276 +319,20 @@ def build_sum_index_from_uploads(
     logger.info(f"Loaded and split {len(docs)} document(s) into {len(nodes)} nodes from: {file_name}")
 
     # SummaryIndex builds its own tree over the docs
-    index = SummaryIndex.from_documents(nodes, 
-                                        storage_context=storage_context
-                                        )
-    # index = DocumentSummaryIndex.from_documents(nodes, 
+    index = VectorStoreIndex.from_documents(nodes,storage_context=storage_context)
+    # index = SummaryIndex.from_documents(nodes, 
+    #                                     show_progress=True,
+    #                                     storage_context=storage_context
+    #                                     )
+    
+    # index = DocumentSummaryIndex.from_documents(nodes,
     #                                             embed_model=embed_model,
-                                                # llm=llm
-                                                # )
+    #                                             show_progress=True,
+    #                                             llm=llm,
+    #                                             storage_context=storage_context
+    # )
     logger.info(f"SummaryIndexed {len(nodes)} nodes into collection '{collection_name}'")
     return index
-
-# def run_chat(
-#     index: Union[VectorStoreIndex, SummaryIndex],
-#     question: str,
-#     *,
-#     llm_model: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-#     response_mode: str = "refine",
-#     top_k: int = 3,
-#     mode: str = "summary"
-# ):
-#     """
-#     Simulate a chat conversation using the chat engine.
-#     """
-#     llm = build_llm(llm_model)
-#     Settings.llm = llm
-
-#     # qe_kwargs = dict(
-#     #     text_qa_template=TEXT_QA_TEMPLATE,
-#     #     metadata_mode=MetadataMode.NONE,
-#     # )
-
-#     if mode == "summary":
-#         summary_query_engine = index.as_chat_engine(
-#         chat_mode="condense_question",
-#         verbose=True,
-#         # vector_store_query_mode="mmr",
-#         # node_postprocessors=[reranker],
-#         # **qe_kwargs
-#     )
-#         response = summary_query_engine.chat(question)
-#         summary_tool = QueryEngineTool.from_defaults(
-#             query_engine=summary_query_engine,
-#             description=(
-#                 "Useful for summarizing of the document."
-#             )
-#         )
-
-#     elif mode == "vector":
-#         vector_query_engine = index.as_chat_engine(
-#             chat_mode="condense_question",
-#             verbose=True,
-#             # vector_store_query_mode="mmr",
-#             # node_postprocessors=[reranker],
-#             # **qe_kwargs
-#         )
-#         vector_tool = QueryEngineTool.from_defaults(
-#             query_engine=vector_query_engine,
-#             description=(
-#                 "Useful for retrieving specific context related to the document."
-#             )
-#         )
-
-#     chat_engine = RouterQueryEngine(
-#         selector=LLMSingleSelector.from_defaults(),
-#         query_engine_tools=[summary_tool, vector_tool],
-#         verbose=True,
-#     )
-#     # chat_engine = index.as_chat_engine(
-#     #     chat_mode="condense_question",
-#     #     verbose=True,
-#         # vector_store_query_mode="mmr",
-#         # node_postprocessors=[reranker],
-#         # **qe_kwargs
-#     # )
-
-#     # For streaming response (if supported by the LLM)
-#     # streaming_response = chat_engine.stream_chat(question)
-#     # return streaming_response or streaming_response.response_gen
-
-#     response = chat_engine.chat(question)
-#     return response
-
-# def build_single_chat_engine(
-#     *,
-#     mode: str,
-#     vec_index: Union[VectorStoreIndex, None],
-#     sum_index: Union[SummaryIndex, None],
-#     llm_model: str,
-#     top_k: int = 3,
-# ):
-#     """
-#     Build exactly ONE chat engine for the selected mode.
-#     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
-#     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
-#     """
-#     llm = build_llm(llm_model)
-#     Settings.llm = llm
-
-#     # Settings.tokenizer = tokenizer = AutoTokenizer.from_pretrained(llm_model)
-#     # max_length = tokenizer.model_max_length
-
-#     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
-
-#     if mode == "summarize":
-#         if sum_index is None:
-#             raise ValueError("SummaryIndex not provided for summarize mode.")
-
-#         summary_query_engine = sum_index.as_chat_engine(
-#             chat_mode="context",
-#             # memory=memory,
-#             verbose=True,
-#             # response_mode="tree_summarize",
-#             # use_async=True,
-#             # text_qa_template=SUMMARIZE_SYSTEM,
-#             # similarity_top_k=top_k,
-#         )
-#         # return engine
-#         summary_tool = QueryEngineTool.from_defaults(
-#             query_engine=summary_query_engine,
-#             description=(
-#                 "Useful for summarizing of the lora paper."
-#             )
-#         )
-#         return summary_tool
-
-#     # explain / teach => vector index
-#     elif mode == "explain":
-#         if vec_index is None:
-#             raise ValueError("VectorStoreIndex not provided for explain mode.")
-
-#         vector_query_engine = vec_index.as_chat_engine(
-#             chat_mode="condense_plus_context",
-#             memory=memory,
-#             verbose=True,
-#         )
-#         # return engine
-
-#         vector_tool = QueryEngineTool.from_defaults(
-#             query_engine=vector_query_engine,
-#             description=(
-#                 "Useful for retrieving specific context related to the document."
-#             )
-#         )
-#         return vector_tool
-    
-#     elif mode == "teach":
-#         if vec_index is None:
-#             raise ValueError("VectorStoreIndex not provided for teach mode.")
-
-#         teach_query_engine = vec_index.as_chat_engine(
-#             chat_mode="react",
-#             memory=memory,
-#             verbose=True,
-#         )
-#         # return engine
-#         teach_tool = QueryEngineTool.from_defaults(
-#             query_engine=teach_query_engine,
-#             description=(
-#                 "Useful for teaching concepts related to the document."
-#             )
-#         )
-#         return teach_tool
-
-#         # chat_engine = RouterQueryEngine(
-#         #     selector=LLMSingleSelector.from_defaults(),
-#         #     query_engine_tools=[summary_tool, vector_tool, teach_tool],
-#         #     verbose=True,
-#         # )
-#         # return chat_engine
-
-# def build_chat_engine(
-#     *,
-#     mode: str,
-#     vec_index: Union[VectorStoreIndex, None],
-#     sum_index: Union[SummaryIndex, None],
-#     llm_model: str,
-#     top_k: int = 3,
-# ):
-#     """
-#     Build exactly ONE chat engine for the selected mode.
-#     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
-#     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
-#     """
-#     # llm = build_llm(llm_model)
-#     # Settings.llm = llm
-
-#     Settings.llm = OpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
-#     # Settings.embed_model = OpenAIEmbedding(model="text-embedding-ada-002")
-
-#     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
-
-#     if mode == "summarize":
-#         if sum_index is None:
-#             raise ValueError("SummaryIndex not provided for summarize mode.")
-
-#         summary_query_engine = sum_index.as_query_engine(
-#             response_mode="tree_summarize",
-#             use_async=True
-#         )
-#         summary_chat_engine = CondenseQuestionChatEngine.from_defaults(
-#             query_engine=summary_query_engine,
-#             condense_question_prompt=CUSTOM_SUMMARIZE_PROMPT,
-#             chat_history=CUSTOM_SUMMARIZE_CHAT_HISTORY,
-#             verbose=True,
-#         )
-
-#         # return summary_chat_engine
-#             # chat_mode="context",
-#             # memory=memory,
-#             # verbose=True,
-#             # response_mode="tree_summarize",
-#             # use_async=True,
-#             # text_qa_template=SUMMARIZE_SYSTEM,
-#             # similarity_top_k=top_k,
-
-#         summary_tool = QueryEngineTool.from_defaults(
-#             query_engine=summary_chat_engine,
-#             description=(
-#                 "Useful for summarizing of documents."
-#             )
-#         )
-#         # return summary_tool
-
-#     # explain / teach => vector index
-#     # elif mode == "explain":
-#     #     if vec_index is None:
-#     #         raise ValueError("VectorStoreIndex not provided for explain mode.")
-
-#     #     vector_query_engine = vec_index.as_chat_engine(
-#     #         chat_mode="condense_plus_context",
-#     #         memory=memory,
-#     #         verbose=True,
-#     #     )
-#         # return engine
-
-#     #     vector_tool = QueryEngineTool.from_defaults(
-#     #         query_engine=vector_query_engine,
-#     #         description=(
-#     #             "Useful for retrieving specific context related to the document."
-#     #         )
-#     #     )
-#     #     return vector_tool
-    
-#     # elif mode == "teach":
-#     #     if vec_index is None:
-#     #         raise ValueError("VectorStoreIndex not provided for teach mode.")
-
-#     #     teach_query_engine = vec_index.as_chat_engine(
-#     #         chat_mode="react",
-#     #         memory=memory,
-#     #         verbose=True,
-#     #     )
-#     #     # return engine
-#     #     teach_tool = QueryEngineTool.from_defaults(
-#     #         query_engine=teach_query_engine,
-#     #         description=(
-#     #             "Useful for teaching concepts related to the document."
-#     #         )
-#     #     )
-#     #     return teach_tool
-
-#     chat_engine = RouterQueryEngine(
-#         selector=LLMSingleSelector.from_defaults(),
-#         query_engine_tools=[summary_tool, 
-#                             # vector_tool, 
-#                             # teach_tool
-#                             ],
-#         verbose=True,
-#     )
-#     return chat_engine
-
 
 def build_chat_engine(
     *,
@@ -630,11 +347,14 @@ def build_chat_engine(
     - summarize -> SummaryIndex (compact synthesis, summarization prompt)
     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
     """
-    # llm = build_llm(llm_model)
-    # Settings.llm = llm
+    llm = build_llm(llm_model)
+    Settings.llm = llm
 
-    Settings.llm = OpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
-    # Settings.embed_model = OpenAIEmbedding(model="text-embedding-ada-002")
+    # llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
+    # Settings.llm = llm
+    
+    # embed = call_openai_embeddings(model="text-embedding-ada-002", api_key=OPENAI_API_KEY)
+    # Settings.embed_model = embed
 
     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
 
@@ -650,64 +370,138 @@ def build_chat_engine(
                 "Useful for retrieving context for summarizing of documents."
             )
         )
-        # return summary_tool
+
+        retriever = summary_tool.retriever
+        summary_context_chat_engine = ContextChatEngine.from_defaults(
+        retriever=retriever,
+        # memory=memory,
+        chat_history= CUSTOM_SUMMARIZE_CHAT_HISTORY,
+        system_prompt= SYSTEM_PROMPT,
+        # prefix_messages=prefix_messages,
+        # node_postprocessors=node_postprocessors,
+        # context_template=CUSTOM_SUMMARIZE_PROMPT,
+        # context_refine_template=context_refine_template,
+        # llm
+        ) 
+    
+        return summary_context_chat_engine
 
     # explain / teach => vector index
-    # elif mode == "explain":
-    #     if vec_index is None:
-    #         raise ValueError("VectorStoreIndex not provided for explain mode.")
+    elif mode == "explain":
+        if vec_index is None:
+            raise ValueError("VectorStoreIndex not provided for explain mode.")
 
-    #     vector_query_engine = vec_index.as_chat_engine(
-    #         chat_mode="condense_plus_context",
-    #         memory=memory,
-    #         verbose=True,
-    #     )
-        # return engine
+        # vector_retriever = vec_index.as_retriever() or VectorIndexAutoRetriever(vec_index)
 
-    #     vector_tool = QueryEngineTool.from_defaults(
-    #         query_engine=vector_query_engine,
-    #         description=(
-    #             "Useful for retrieving specific context related to the document."
-    #         )
-    #     )
-    #     return vector_tool
+        # vector_tool = RetrieverTool.from_defaults(
+        #     retriever=vector_retriever,
+        #     description=(
+        #         "Useful for retrieving context for explaining of documents."
+        #     )
+        # )
+        # retriever = vector_tool.retriever
+
+        explain_query_engine = vec_index.as_query_engine()
+
+        explain_query_engine_tool = QueryEngineTool.from_defaults(
+            query_engine=explain_query_engine,
+            name="explain_query_engine",
+            description=(
+                "Useful for retrieving contents from the documents for explaining purposes based on the user's query."
+            )
+        )
+
+        explain_context_chat_engine = CondenseQuestionChatEngine.from_defaults(
+            query_engine=explain_query_engine_tool.query_engine,
+            # condense_question_prompt=condense_question_prompt,
+            # chat_history=CUSTOM_EXPLAIN_CHAT_HISTORY,
+            # system_prompt=SYSTEM_PROMPT,
+            # memory=memory,
+            # memory_cls= memory_cls,
+            # prefix_messages=prefix_messages,
+            verbose=True,
+            # llm
+        )
+        return explain_context_chat_engine
+
+    elif mode == "teach":
+        if vec_index is None:
+            raise ValueError("VectorStoreIndex not provided for teach mode.")
+
+        teach_engine = vec_index.as_query_engine() #or VectorIndexAutoRetriever(vec_index)
+
+        teach_engine_tool = QueryEngineTool.from_defaults(
+            query_engine=teach_engine,
+            description=(
+                "Useful for retrieving contents from the documents for teaching purposes based on the user's query."
+            )
+        )
+        web_tools = DuckDuckGoSearchToolSpec().to_tool_list()
+        retriever_agent = FunctionAgent(
+            name="retriever",
+            description="Manages data retrieval from the documents and use that as context for teaching purposes.",
+            system_prompt="You are a retrieval assistant.",
+            tools=[teach_engine_tool, *web_tools],
+            llm=llm,
+            can_handoff_to=["web_search", "final_answer"],
+        )
+        agent_workflow = AgentWorkflow(
+            agents=[retriever_agent],
+            root_agent="retriever",
+        )
+        return agent_workflow
     
-    # elif mode == "teach":
-    #     if vec_index is None:
-    #         raise ValueError("VectorStoreIndex not provided for teach mode.")
 
-    #     teach_query_engine = vec_index.as_chat_engine(
-    #         chat_mode="react",
-    #         memory=memory,
-    #         verbose=True,
-    #     )
-    #     # return engine
-    #     teach_tool = QueryEngineTool.from_defaults(
-    #         query_engine=teach_query_engine,
-    #         description=(
-    #             "Useful for teaching concepts related to the document."
-    #         )
-    #     )
-    #     return teach_tool
+        # agent = ReActAgent(
+        #     tools=[teach_engine_tool],
+        #     llm=llm,
+        #     # system_prompt=SYSTEM_PROMPT
+        # )      
+        # 
+        # return agent
 
 
-    retriever = RouterRetriever(
-        selector=PydanticSingleSelector.from_defaults(), #LLMSingleSelector
-        retriever_tools=[ summary_tool],
-    )
+        # teach_retriever = vec_index.as_retriever() #or VectorIndexAutoRetriever(vec_index)
+        # teach_tool = RetrieverTool.from_defaults(
+        #     retriever=teach_retriever,
+        #     description=(
+        #         "Useful for retrieving contents from the documents for teaching purposes based on the user's query."
+        #     )
+        # )
 
-    context_chat_engine = ContextChatEngine.from_defaults(
-    retriever=retriever
-    )
+        # teaching_context_chat_engine = CondenseQuestionChatEngine.from_defaults( #ReActAgent or FunctionAgent classes from llama_index.core.agent.workflow
+        # retriever=teach_retriever_tool,
+        # memory=memory,
+        # chat_history=chat_history,
+        # system_prompt= system ,
+        # prefix_messages=prefix_messages,
+        # node_postprocessors=node_postprocessors,
+        # context_template=context_template,
+        # context_refine_template=context_refine_template,
+        # llm
+        # )
 
 
-    return context_chat_engine
+        # teach_retriever_tool = teach_tool
+        # web_tools = DuckDuckGoSearchToolSpec().to_tool_list()
+
+        # teaching_agent = ReActAgent(tools=[teach_retriever_tool, *web_tools], llm=llm)
+        # return teaching_agent
+    
+    # retriever = RouterRetriever(
+    #     selector=LLMSingleSelector.from_defaults(), #LLMSingleSelector PydanticSingleSelector
+    #     retriever_tools=[summary_context_chat_engine, 
+    #                      explain_context_chat_engine, 
+    #                      teach_tool
+    #                     ],
+    # )
 
 
-def main():
+
+async def main():
     parser = argparse.ArgumentParser(description="RAG over a single PDF using LlamaIndex + Qdrant")
     parser.add_argument("--data-file", type=str, required=True, help="Path to a PDF to index")
-    parser.add_argument("--llm-model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0") # TinyLlama/TinyLlama-1.1B-Chat-v1.0 Qwen/Qwen1.5-1.8B-Chat meta-llama/Llama-3.1-8B HuggingFaceH4/zephyr-7b-beta  openai/gpt-oss-20b
+    parser.add_argument("--llm-model", type=str, default="meta-llama/Llama-3.2-3B-Instruct") # meta-llama/Llama-3.2-3B-Instruct meta-llama/Llama-3.1-8B TinyLlama/TinyLlama-1.1B-Chat-v1.0 Qwen/Qwen1.5-1.8B-Chat meta-llama/Llama-3.1-8B HuggingFaceH4/zephyr-7b-beta  openai/gpt-oss-20b
     parser.add_argument("--embed-model", type=str, default="BAAI/bge-base-en-v1.5")
     parser.add_argument("--qdrant-host", type=str, default="localhost")
     parser.add_argument("--qdrant-port", type=int, default=6333)
@@ -751,47 +545,117 @@ def main():
                 collection_name=args.vec_collection,
             )
 
-        # Build exactly one chat engine for the chosen mode
-        # chat_engine = build_single_chat_engine(
-        #     mode=mode,
-        #     vec_index=vec_index,
-        #     sum_index=sum_index,
-        #     llm_model=args.llm_model,
-        #     top_k=args.top_k,
-        # )
-        chat_engine= build_chat_engine(
-            mode=mode,
-            vec_index=vec_index,
-            sum_index=sum_index,
-            llm_model=args.llm_model,
-            top_k=args.top_k,
-        )
+        if mode == "summarize" or mode == "explain":
+
+            # Build exactly one chat engine for the chosen mode
+            chat_engine= build_chat_engine(
+                mode=mode,
+                vec_index=vec_index,
+                sum_index=sum_index,
+                llm_model=args.llm_model,
+                top_k=args.top_k,
+            )
+
+            print(f"Interactive chat started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
+            while True:
+                question = input("\nUser: ")
+                if question.lower() in {"exit", "quit"}:
+                    print("Exiting chat.")
+                    break
+
+                chat_resp = chat_engine.chat(question)
+                payload = format_response_payload(chat_resp, max_citations=5)
+                print(f"Assistant: {payload['answer']}")
+
+                if payload["citations"]:
+                    print("CITATIONS:")
+                    for i, c in enumerate(payload["citations"], 1):
+                        print(f"[{i}] {c}")
+
+        elif mode == "teach":
+            # Build exactly one chat engine for the chosen mode
+            agent = build_chat_engine(
+                mode=mode,
+                vec_index=vec_index,
+                sum_index=sum_index,
+                llm_model=args.llm_model,
+                top_k=args.top_k,
+            )
+            # question = "based on these new tax laws, give me a strategy on how an employee who earns 800,000 NGN monthly can adjust their financial planning and make the most of their income while complying with the new regulations"
+            # ctx = Context(agent)
+            # print(await agent.run(question, ctx=ctx, stream=True))
+
+            # agent_handler = await agent.run(question, ctx=ctx, stream=True)
+            # print(agent_handler)
+
+            # print(f"Interactive teaching agent started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
+            while True:
+                # avoid blocking the event loop with input()
+                question = input("\nUser: ")
+                # question = await asyncio.to_thread(input, "\nUser: ")
+                if question.lower() in {"exit", "quit"}:
+                    print("Exiting teaching agent.")
+                    break
+
+                # >>> use the async API
+                ctx = Context(agent)
+                agent_resp = await agent.run(question, ctx=ctx, stream=True)
+
+                print(agent_resp)
+
+            # handler = agent.chat(user_msg=question)  #Optional[Union[str, ChatMessage]] = None,
+                                    #   chat_history=chat_history,  #Optional[List[ChatMessage]] = None,
+                                    #   memory=memory,  #Optional[BaseMemory] = None,
+                                    #   ctx=ctx,  #Optional[Context] = None,
+                                    #   max_iterations=max_iterations,  #Optional[int] = None,
+                                    #   start_event=start_event  #Optional[Event] = None
+                                    # )
+            # print(handler.stream_events())
 
 
-        
-        print(f"Interactive chat started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
-        while True:
-            question = input("\nUser: ").strip()
-            if question.lower() in {"exit", "quit"}:
-                print("Exiting chat.")
-                break
+            # prompt_dict = handler.get_prompts()
+            # for k, v in prompt_dict.items():
+            #     print(f"Prompt: {k}\n\nValue: {v.template}")
 
-            chat_resp = chat_engine.chat(question)
-            payload = format_response_payload(chat_resp, max_citations=5)
-            print(f"Assistant: {payload['answer']}")
+            # async for ev in handler.stream_events():
+            #     if isinstance(ev, ToolCallResult):
+            #         print(f"\nCall {ev.tool_name} with {ev.tool_kwargs}\nReturned: {ev.tool_output}")
+            #     if isinstance(ev, AgentStream):
+            #         print(f"{ev.delta}", end="", flush=True)
 
-            if payload["citations"]:
-                print("CITATIONS:")
-                for i, c in enumerate(payload["citations"], 1):
-                    print(f"[{i}] {c}")
+            # response = await handler
+
+
+
+            # print(f"Interactive teaching agent started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
+            # while True:
+            #     # avoid blocking the event loop with input()
+            #     question = await asyncio.to_thread(input, "\nUser: ")
+            #     question = question
+            #     if question.lower() in {"exit", "quit"}:
+            #         print("Exiting teaching agent.")
+            #         break
+
+            #     # >>> use the async API
+            #     ctx = Context(agent)
+            #     agent_resp = await agent.run(question, ctx=ctx, stream=True)
+
+                # print(f"Assistant: {agent_resp}")
+
 
     except Exception as e:
         logger.error(f"Error running RAG: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
+
 
 # explain the implication of the new tax law for an employee
 
 # what are the key points of the document
+
+# based on the new tax law, give me a strategy on how an employee who earns 800,000 NGN monthly can adjust their financial planning and make the most of their income while complying with the new regulations
+
