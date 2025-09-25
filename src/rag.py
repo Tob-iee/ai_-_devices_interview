@@ -56,6 +56,12 @@ logger = logging.getLogger("rag-core")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+LLAMA_PARSE_API_KEY = os.getenv("LLAMA_PARSE_API_KEY")
+
+QHOST = os.getenv("QDRANT_HOST", "localhost")
+QPORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL")
 
 @lru_cache(maxsize=3)
 def build_llm(model_name: str) -> HuggingFaceLLM:
@@ -91,20 +97,30 @@ def build_hf_embeddings(embed_model: str) -> None:
     return HuggingFaceEmbedding(model_name=embed_model)
 
 def connect_qdrant(
-    host: str = "localhost",
-    port: int = 6333,
+    url: str | None = None,
+    api_key: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
     collection_name: str = "ai-document-assistant",
 ) -> StorageContext:
-    """Connect to Qdrant or fall back to :memory: mode; return storage context."""
+    """Connect to Qdrant cloud server or fall back to in-memory mode; return storage context."""
 
+    url = url or os.getenv("QDRANT_URL")
+    api_key = api_key or os.getenv("QDRANT_API_KEY")
 
     try:
-        client = QdrantClient(host=host, port=port, timeout=10.0, retries=3)
-        # simple ping
-        _ = client.get_collections()
-        logger.info(f"Qdrant reachable at {host}:{port}")
-    except Exception:
-        logger.warning(f"Qdrant not reachable at {host}:{port} — using in-memory mode.")
+        if url:
+            client = QdrantClient(url=url, api_key=api_key)
+            _ = client.get_collections()
+            logger.info(f"Qdrant Cloud reachable at {url}")
+        else:
+            host = host or os.getenv("QDRANT_HOST", "localhost")
+            port = int(port or os.getenv("QDRANT_PORT", "6333"))
+            client = QdrantClient(host=host, port=port)
+            _ = client.get_collections()
+            logger.info(f"Qdrant reachable at {host}:{port}")
+    except Exception as e:
+        logger.warning(f"Qdrant not reachable ({e}) — using in-memory mode.")
         client = QdrantClient(location=":memory:")
 
     vector_store = QdrantVectorStore(client=client, collection_name=collection_name)
@@ -139,6 +155,8 @@ def build_vec_index_from_uploads(
     file: Union[str, bytes, io.BytesIO],
     embed_model: str,
     *,
+    url: str | None = None,
+    api_key: str | None = None,
     host: str = "localhost",
     port: int = 6333,
     collection_name: str = "ai-document-assistant-vectors",
@@ -155,6 +173,8 @@ def build_vec_index_from_uploads(
     Settings.chunk_overlap = chunk_overlap
 
     storage_context = connect_qdrant(
+        url=url,
+        api_key=api_key,
         host=host,
         port=port,
         collection_name=collection_name,
@@ -181,19 +201,15 @@ def build_vec_index_from_uploads(
         index = VectorStoreIndex.from_vector_store(vector_store)
         return index
 
+
     # Parse and index the document if not already indexed
     try:
-        parser = LlamaParse(result_type="text")
-        docs = SimpleDirectoryReader(
-            input_files=[file_path],
-            file_extractor={".pdf": parser},
-        ).load_data()
+        parser = LlamaParse(result_type="text", api_key=LLAMA_PARSE_API_KEY)
+        docs = SimpleDirectoryReader(input_files=[file_path],file_extractor={".pdf": parser},).load_data()
         logger.info("Parsed with LlamaParse")
     except Exception as e:
         logger.warning(f"LlamaParse failed ({e}); falling back to SimpleDirectoryReader")
         docs = SimpleDirectoryReader(input_files=[file_path]).load_data()
-
-    logger.info(f"Loaded {len(docs)} document(s) from: {file_name}")
 
     # Add file_name as metadata to each document
     for doc in docs:
@@ -206,23 +222,25 @@ def build_vec_index_from_uploads(
         embed_model=embed
     )
     nodes = semantic_splitter.get_nodes_from_documents(docs)
-
-    index = VectorStoreIndex.from_documents(
-        nodes,
-        storage_context=storage_context,
-    )
     logger.info(f"Indexed {len(nodes)} nodes into collection '{collection_name}'")
+
+
+    index = VectorStoreIndex.from_documents(nodes, storage_context=storage_context)
+    logger.info(f"Upserted {len(nodes)} chunks into '{collection_name}' (doc={file_name})")
     return index
+
 
 def build_sum_index_from_uploads(
     file: Union[str, bytes, io.BytesIO],
     embed_model: str,
     *,
+    url: str | None = None,
+    api_key: str | None = None,
     host: str = "localhost",
     port: int = 6333,
     collection_name: str = "ai-document-assistant-summary",
-    chunk_size: int = 100,
-    chunk_overlap: int = 20,
+    chunk_size: int = 200,
+    chunk_overlap: int = 50,
 ) -> VectorStoreIndex:
     """
     Build a summary on index for a single uploaded PDF.
@@ -235,6 +253,8 @@ def build_sum_index_from_uploads(
     Settings.chunk_overlap = chunk_overlap
 
     storage_context = connect_qdrant(
+        url=url,
+        api_key=api_key,
         host=host,
         port=port,
         collection_name=collection_name,
@@ -243,6 +263,7 @@ def build_sum_index_from_uploads(
 
     file_path = _ensure_path_from_single_file(file)
     file_name = os.path.basename(file_path)
+
 
     # Check if file has already been indexed by searching for its metadata
     try:
@@ -261,12 +282,11 @@ def build_sum_index_from_uploads(
         index = VectorStoreIndex.from_vector_store(summary_store)
         return index
 
+
     # Parse and index the document if not already indexed
     try:
-        parser = LlamaParse(result_type="markdown")
-        docs = SimpleDirectoryReader(
-            input_files=[file_path], file_extractor={".pdf": parser},
-        ).load_data()
+        parser = LlamaParse(result_type="text", api_key=LLAMA_PARSE_API_KEY)
+        docs = SimpleDirectoryReader(input_files=[file_path], file_extractor={".pdf": parser}).load_data()
         logger.info("Parsed with LlamaParse")
     except Exception as e:
         logger.warning(f"LlamaParse failed ({e}); falling back to SimpleDirectoryReader")
@@ -281,9 +301,10 @@ def build_sum_index_from_uploads(
     nodes = splitter.get_nodes_from_documents(docs)
     logger.info(f"Loaded and split {len(docs)} document(s) into {len(nodes)} nodes from: {file_name}")
 
+
     # Summary Index builds its own tree over the docs
     index = VectorStoreIndex.from_documents(nodes, storage_context=storage_context)
-    logger.info(f"Summary Indexed {len(nodes)} nodes into collection '{collection_name}'")
+    logger.info(f"Upserted {len(nodes)} chunks into '{collection_name}' (doc={file_name})")
     return index
 
 def build_chat_engine(
@@ -324,16 +345,12 @@ def build_chat_engine(
         chat_history= CUSTOM_SUMMARIZE_CHAT_HISTORY,
         system_prompt= SYSTEM_PROMPT,
         memory=memory,
-        # prefix_messages=prefix_messages,
-        # node_postprocessors=node_postprocessors,
-        # context_template=CUSTOM_SUMMARIZE_PROMPT,
-        # context_refine_template=context_refine_template,
         llm=hf_os_llm
         )
 
         return summary_context_chat_engine
 
-    # explain / teach => vector index
+    # explain => vector index
     elif mode == "explain":
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for explain mode.")
@@ -355,19 +372,16 @@ def build_chat_engine(
         # chat_history= CUSTOM_EXPLAIN_CHAT_HISTORY,
         system_prompt= SYSTEM_PROMPT,
         memory=memory,
-        # prefix_messages=prefix_messages,
-        # node_postprocessors=node_postprocessors,
-        # context_template=CUSTOM_EXPLAIN_PROMPT,
-        # context_refine_template=context_refine_template,
         llm=hf_os_llm
         )
 
         return explain_context_chat_engine
 
+    # teach => vector index
     elif mode == "teach":
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for teach mode.")
-        llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
+        llm = call_groq_llm(model_name=llm_model, api_key=GROQ_API_KEY) #gpt-4o-mini
         Settings.llm = llm
 
         teach_engine = vec_index.as_query_engine() 
@@ -393,128 +407,4 @@ def build_chat_engine(
     return agent_workflow
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="RAG over a single PDF using LlamaIndex + Qdrant")
-    parser.add_argument("--data-file", type=str, required=True, help="Path to a PDF to index")
-    parser.add_argument("--llm-model", type=str, default="meta-llama/Llama-3.2-3B-Instruct") # meta-llama/Llama-3.2-3B-Instruct meta-llama/Llama-3.1-8B TinyLlama/TinyLlama-1.1B-Chat-v1.0 Qwen/Qwen1.5-1.8B-Chat meta-llama/Llama-3.1-8B HuggingFaceH4/zephyr-7b-beta  openai/gpt-oss-20b
-    parser.add_argument("--embed-model", type=str, default="BAAI/bge-base-en-v1.5")
-    parser.add_argument("--qdrant-host", type=str, default="localhost")
-    parser.add_argument("--qdrant-port", type=int, default=6333)
-
-    # separate collections (avoid collisions if you later build both)
-    parser.add_argument("--vec-collection", type=str, default="ai-doc-assistant-vectors")
-    parser.add_argument("--sum-collection", type=str, default="ai-doc-assistant-summary")
-
-    parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--mode", type=str, choices=["summarize", "explain", "teach"],
-                        default="summarize", help="Select interaction mode.")
-    args = parser.parse_args()
-
-    if not os.path.isfile(args.data_file):
-        logger.error(f"Data file not found: {args.data_file}")
-        sys.exit(1)
-
-    try:
-        mode = args.mode.lower()
-
-        # Build only the index you need for the selected mode
-        vec_index = None
-        sum_index = None
-
-        if mode == "summarize":
-            sum_index = build_sum_index_from_uploads(
-                file=args.data_file,
-                embed_model=args.embed_model,
-                host=args.qdrant_host,
-                port=args.qdrant_port,
-                collection_name=args.sum_collection,
-            )
-
-            
-        else:  # explain or teach => vector
-            vec_index = build_vec_index_from_uploads(
-                file=args.data_file,
-                embed_model=args.embed_model,
-                host=args.qdrant_host,
-                port=args.qdrant_port,
-                collection_name=args.vec_collection,
-            )
-
-        chat_engine_tool = build_chat_engine(
-            mode=mode,
-            vec_index=vec_index,
-            sum_index=sum_index,
-            llm_model=args.llm_model,
-            top_k=args.top_k,
-        )
-
-        print(chat_engine_tool)
-
-
-        if mode == "summarize" or mode == "explain":
-
-            # Build exactly one chat engine for the chosen mode
-            chat_engine= build_chat_engine(
-                mode=mode,
-                vec_index=vec_index,
-                sum_index=sum_index,
-                llm_model=args.llm_model,
-                top_k=args.top_k,
-            )
-
-            print(f"Interactive chat started. Mode = {args.mode}. Type 'exit' or 'quit' to end.")
-            while True:
-                question = input("\nUser: ")
-                if question.lower() in {"exit", "quit"}:
-                    print("Exiting chat.")
-                    break
-
-                chat_resp = chat_engine.chat(question)
-                payload = format_response_payload(chat_resp, max_citations=5)
-                print(f"Assistant: {payload['answer']}")
-
-                if payload["citations"]:
-                    print("CITATIONS:")
-                    for i, c in enumerate(payload["citations"], 1):
-                        print(f"[{i}] {c}")
-
-        elif mode == "teach":
-            # Build exactly one chat engine for the chosen mode
-            agent = build_chat_engine(
-                mode=mode,
-                vec_index=vec_index,
-                sum_index=sum_index,
-                llm_model=args.llm_model,
-                top_k=args.top_k,
-            )
-
-            while True:
-                # avoid blocking the event loop with input()
-                question = input("\nUser: ")
-                # question = await asyncio.to_thread(input, "\nUser: ")
-                if question.lower() in {"exit", "quit"}:
-                    print("Exiting teaching agent.")
-                    break
-
-                # >>> use the async API
-                ctx = Context(agent)
-                agent_resp = await agent.run(question, ctx=ctx, stream=True)
-
-                print(agent_resp)
-
-    except Exception as e:
-        logger.error(f"Error running RAG: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
-
-# explain the implication of the new tax law for an employee
-
-# what are the key points of the document
-
-# based on the new tax law, give me a strategy on how an employee who earns 800,000 NGN monthly can adjust their financial planning and make the most of their income while complying with the new regulations
 
