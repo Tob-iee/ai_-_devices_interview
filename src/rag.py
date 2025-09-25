@@ -212,9 +212,9 @@ def build_vec_index_from_uploads(
         docs = SimpleDirectoryReader(input_files=[file_path]).load_data()
 
     # Add file_name as metadata to each document
-    for doc in docs:
-        doc.metadata = doc.metadata or {}
-        doc.metadata["file_name"] = file_name
+    for d in docs:
+        d.metadata = d.metadata or {}
+        d.metadata["file_name"] = file_name
 
     semantic_splitter = SemanticSplitterNodeParser(
         buffer_size=1,
@@ -229,7 +229,6 @@ def build_vec_index_from_uploads(
     logger.info(f"Upserted {len(nodes)} chunks into '{collection_name}' (doc={file_name})")
     return index
 
-
 def build_sum_index_from_uploads(
     file: Union[str, bytes, io.BytesIO],
     embed_model: str,
@@ -239,8 +238,8 @@ def build_sum_index_from_uploads(
     host: str = "localhost",
     port: int = 6333,
     collection_name: str = "ai-document-assistant-summary",
-    chunk_size: int = 200,
-    chunk_overlap: int = 50,
+    chunk_size: int = 350,
+    chunk_overlap: int = 60,
 ) -> VectorStoreIndex:
     """
     Build a summary on index for a single uploaded PDF.
@@ -405,6 +404,3 @@ def build_chat_engine(
             root_agent="retriever",
         )
     return agent_workflow
-
-
-

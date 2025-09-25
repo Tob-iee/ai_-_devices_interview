@@ -24,14 +24,16 @@ GROQ_MODELS = [
     # ensure these exist/are enabled for your Groq account
     "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
-    "llama-3.1-70b-versatile",
+    "meta-llama/llama-guard-4-12b"
 ]
 
 # Shown only when mode is "summarize" or "explain"
 HF_MODELS = [
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "meta-llama/Llama-3.2-3B-Instruct",
     "meta-llama/Llama-3.1-8B",
     "HuggingFaceH4/zephyr-7b-beta",
+    "Qwen/Qwen1.5-1.8B-Chat",
     "Qwen/Qwen2.5-7B-Instruct",
 ]
 

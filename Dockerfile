@@ -24,8 +24,7 @@ WORKDIR /app
 COPY pyproject.toml poetry.lock ./
 
 # Install deps (no dev) into the global env
-RUN poetry install --no-dev --no-ansi
-
+RUN poetry install --no-root
 
 # Final image — copy deps from base
 FROM python:3.11-slim
