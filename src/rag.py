@@ -14,26 +14,15 @@ from transformers import AutoTokenizer
 
 from llama_index.core import (
     Settings,
-    SummaryIndex,
     VectorStoreIndex,
-    DocumentSummaryIndex,
     SimpleDirectoryReader,
 )
 
 from llama_index.core.retrievers import VectorIndexAutoRetriever
-
-
-from llama_index.core.prompts import PromptTemplate
-from llama_index.core.schema import MetadataMode
-from llama_index.core.tools import QueryEngineTool #RetrieverQueryEngine
-from llama_index.core.selectors import LLMSingleSelector
+from llama_index.core.tools import QueryEngineTool 
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.query_engine.router_query_engine import RouterQueryEngine
-from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.node_parser import SentenceSplitter, SemanticSplitterNodeParser
 
-from llama_index.core.retrievers import RouterRetriever
-from llama_index.core.selectors import PydanticSingleSelector
 from llama_index.core.tools import RetrieverTool
 
 from llama_index.llms.groq import Groq
@@ -42,25 +31,20 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from llama_parse import LlamaParse
 
-from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.core.chat_engine import ContextChatEngine, CondensePlusContextChatEngine, CondenseQuestionChatEngine
+from llama_index.core.chat_engine import ContextChatEngine, CondensePlusContextChatEngine
 
 from qdrant_client import QdrantClient
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.storage.storage_context import StorageContext
 
 from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
-from llama_index.core.agent.workflow import FunctionAgent, AgentWorkflow, ReActAgent, AgentStream, ToolCallResult
+from llama_index.core.agent.workflow import FunctionAgent, AgentWorkflow
 
 from llama_index.core.workflow import Context
 
 from core.prompts import (
     SYSTEM_PROMPT,
     TEXT_QA_TEMPLATE,
-    SUMMARIZE_SYSTEM,
-    EXPLAIN_SYSTEM,
-    TEACH_SYSTEM,
-    CUSTOM_SUMMARIZE_PROMPT,
     CUSTOM_SUMMARIZE_CHAT_HISTORY,
 )
 
@@ -167,7 +151,6 @@ def build_vec_index_from_uploads(
     embed = build_hf_embeddings(embed_model)
     Settings.embed_model = embed
 
-
     Settings.chunk_size = chunk_size
     Settings.chunk_overlap = chunk_overlap
 
@@ -200,7 +183,7 @@ def build_vec_index_from_uploads(
 
     # Parse and index the document if not already indexed
     try:
-        parser = LlamaParse(result_type="markdown")
+        parser = LlamaParse(result_type="text")
         docs = SimpleDirectoryReader(
             input_files=[file_path],
             file_extractor={".pdf": parser},
@@ -242,7 +225,7 @@ def build_sum_index_from_uploads(
     chunk_overlap: int = 20,
 ) -> VectorStoreIndex:
     """
-    Build a SummaryIndex for a single uploaded PDF.
+    Build a summary on index for a single uploaded PDF.
     """
 
     embed = build_hf_embeddings(embed_model)
@@ -275,7 +258,6 @@ def build_sum_index_from_uploads(
 
     if already_indexed:
         logger.info(f"File '{file_name}' already indexed. Loading existing index.")
-        # index = SummaryIndex(summary_store, show_progress=True, storage_context=storage_context)
         index = VectorStoreIndex.from_vector_store(summary_store)
         return index
 
@@ -299,35 +281,34 @@ def build_sum_index_from_uploads(
     nodes = splitter.get_nodes_from_documents(docs)
     logger.info(f"Loaded and split {len(docs)} document(s) into {len(nodes)} nodes from: {file_name}")
 
-    # SummaryIndex builds its own tree over the docs
+    # Summary Index builds its own tree over the docs
     index = VectorStoreIndex.from_documents(nodes, storage_context=storage_context)
-    logger.info(f"SummaryIndexed {len(nodes)} nodes into collection '{collection_name}'")
+    logger.info(f"Summary Indexed {len(nodes)} nodes into collection '{collection_name}'")
     return index
 
 def build_chat_engine(
     *,
     mode: str,
     vec_index: Union[VectorStoreIndex, None],
-    sum_index: Union[SummaryIndex, None],
+    sum_index: Union[VectorStoreIndex, None],
     llm_model: str,
     top_k: int = 3,
 ):
     """
     Build exactly ONE chat engine for the selected mode.
-    - summarize -> SummaryIndex (compact synthesis, summarization prompt)
+    - summarize -> VectorStoreIndex (compact synthesis, summarization prompt)
     - explain/teach -> VectorStoreIndex (refine synthesis, QA/refine templates)
     """
-    hf_os_llm = build_llm(llm_model)
-    llm = call_groq_llm(model_name="openai/gpt-oss-20b", api_key=GROQ_API_KEY) #gpt-4o-mini
-
-    # Settings.llm = llm
     
     memory = ChatMemoryBuffer.from_defaults(token_limit=500)
 
     if mode == "summarize":
         if sum_index is None:
-            raise ValueError("SummaryIndex not provided for summarize mode.")
-
+            raise ValueError("Summary Index not provided for summarize mode.")
+        
+        hf_os_llm = build_llm(llm_model)
+        Settings.llm = hf_os_llm
+        
         summary_retriever = sum_index.as_retriever() or VectorIndexAutoRetriever(sum_index)
 
         summary_tool = RetrieverTool.from_defaults(
@@ -356,6 +337,9 @@ def build_chat_engine(
     elif mode == "explain":
         if vec_index is None:
             raise ValueError("VectorStoreIndex not provided for explain mode.")
+        
+        hf_os_llm = build_llm(llm_model)
+        Settings.llm = hf_os_llm
 
         explain_retriever = vec_index.as_retriever() or VectorIndexAutoRetriever(vec_index)
 
@@ -373,7 +357,7 @@ def build_chat_engine(
         memory=memory,
         # prefix_messages=prefix_messages,
         # node_postprocessors=node_postprocessors,
-        # context_template=CUSTOM_SUMMARIZE_PROMPT,
+        # context_template=CUSTOM_EXPLAIN_PROMPT,
         # context_refine_template=context_refine_template,
         llm=hf_os_llm
         )
