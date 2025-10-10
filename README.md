@@ -1,4 +1,4 @@
-# Assistant-Chat-Assistant – Documentation & Setup Guide
+# Document-Chat-Assistant – Documentation & Setup Guide
 
 This app is a Retrieval-Augmented Generation (RAG) assistant for your PDFs. Upload a document, pick a mode, and chat to get summaries, explanations, or teaching-style guidance grounded in the file you uploaded.
 
