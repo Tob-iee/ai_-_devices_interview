@@ -1,6 +1,6 @@
 # Document-Chat-Assistant – Documentation & Setup Guide
 
-This app is a Retrieval-Augmented Generation (RAG) assistant for your PDFs. Upload a document, pick a mode, and chat to get summaries, explanations, or teaching-style guidance grounded in the file you uploaded.
+Built an agentic Retrieval-Augmented Generation (RAG) system that enables users to chat interactively with their PDF documents. Users can upload a file, select from multiple AI interaction modes (summarization, explanation, or teaching-style guidance), and receive conversational, context-aware responses grounded directly in the document content. The system leverages an AI agent architecture to dynamically adjust response style and reasoning approach based on the selected mode, enhancing usability for research, learning, and technical document exploration.
 
 ## Architecture
 
